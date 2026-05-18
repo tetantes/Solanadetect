@@ -2,120 +2,252 @@ import asyncio
 import json
 import logging
 import os
+import signal
+import sys
 import httpx
 from fastapi import FastAPI
 from websockets import connect
 
-app = FastAPI()
+# ----------------------------------------------------
+# ENVIRONMENT VARIABLES & CONFIGURATION
+# ----------------------------------------------------
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8317307510:AAHqbY63j5vlt70WaaFZGe2We40E-E_fMyM")
+CHAT_ID = os.getenv("CHAT_ID", "6011460052")
+SOLANA_RPC_WS = os.getenv("SOLANA_RPC_WS")
+SOLANA_RPC_HTTP = os.getenv("SOLANA_RPC_HTTP")
 
-@app.get("/")
-def health_check():
-    return {"status": "healthy", "service": "Live Mint Radar Active"}
+# Target Dex Infrastructure Programs
+PUMP_FUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+RAYDIUM_AMM = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+RAYDIUM_CLMM = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
 
-# Target System Keys
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8317307510:AAHqbY63j5vlt70WaaFZGe2We40E-E_fMyM")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "6011460052")
-RPC_WSS_URL = os.getenv("RPC_WSS_URL")  # MUST use wss:// instead of https://
-
-RAYDIUM_LP_V4 = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+MIN_LIQUIDITY_USD = 1000.0
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-async def send_telegram_alert(client: httpx.AsyncClient, token_address: str, signature: str):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    
-    # The <code> tags around the token address make it click-to-copy in Telegram
-    alert_msg = (
-        f"🚨 <b>NEW SOLANA LAUNCH DETECTED</b> 🚨\n\n"
-        f"📃 <b>Mint/CA:</b>\n<code>{token_address}</code>\n\n"
-        f"🔗 <a href='https://dexscreener.com/solana/{token_address}'>DexScreener</a> | "
-        f"<a href='https://rugcheck.xyz/tokens/{token_address}'>RugCheck</a>\n"
-        f"📦 <a href='https://solscan.io/tx/{signature}'>Tx Log Signature</a>"
-    )
-    
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": alert_msg,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
-    try:
-        await client.post(url, json=payload, timeout=5.0)
-        logger.info(f"✨ Instant Alert Sent for: {token_address}")
-    except Exception as e:
-        logger.error(f"Telegram Alert Route Blocked: {e}")
+# FastAPI app instantiated to satisfy Koyeb Health Routing Layer
+app = FastAPI()
 
-async def process_transaction(client: httpx.AsyncClient, signature: str, rpc_http_url: str):
-    """Fetches full transaction payload block details to isolate the Mint CA"""
-    try:
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getTransaction",
-            "params": [
-                signature,
-                {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
-            ]
-        }
-        response = await client.post(rpc_http_url, json=payload, timeout=10.0)
-        if response.status_code != 200: return
+@app.get("/")
+async def health_check():
+    return {"status": "healthy", "pipeline": "Solana Live Mint Radar"}
 
-        tx_data = response.json().get("result", {})
-        if not tx_data: return
 
-        meta = tx_data.get("meta", {})
-        post_balances = meta.get("postTokenBalances", [])
-        
-        for balance in post_balances:
-            mint = balance.get("mint")
-            # Filter out Native WSOL wrapping contract address
-            if mint and mint != "So11111111111111111111111111111111111111112":
-                await send_telegram_alert(client, mint, signature)
-                break
-    except Exception as e:
-        logger.error(f"Extraction processing anomaly on tx {signature}: {e}")
+class LiveMintRadar:
+    def __init__(self):
+        self.http_client = None
+        self.processing_queue = asyncio.Queue()
+        self.alert_queue = asyncio.Queue()
+        self.is_running = True
 
-async def listen_to_blockchain():
-    if not RPC_WSS_URL:
-        logger.error("CRITICAL ERROR: RPC_WSS_URL environment variable is empty!")
-        return
+    async def init_client(self):
+        limits = httpx.Limits(max_keepalive_connections=10, max_connections=30)
+        self.http_client = httpx.AsyncClient(limits=limits, timeout=10.0)
 
-    rpc_http_url = RPC_WSS_URL.replace("wss://", "https://")
+    async def close_client(self):
+        if self.http_client:
+            await self.http_client.aclose()
 
-    limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
-    async with httpx.AsyncClient(limits=limits) as httpx_client:
-        while True:
+    # ----------------------------------------------------
+    # CORE TASKS: PIPELINE AGGREGATOR
+    # ----------------------------------------------------
+    async def ws_listener(self):
+        """Maintains low-latency WebSocket logs subscription loop"""
+        backoff = 1.0
+        while self.is_running:
             try:
                 logger.info("Connecting to Solana WebSocket Stream...")
-                async with connect(RPC_WSS_URL) as websocket:
-                    subscription_payload = {
+                async with connect(SOLANA_RPC_WS) as ws:
+                    backoff = 1.0  # Reset on successful link
+                    
+                    # Target all structural logs mentioning our target programs
+                    payload = {
                         "jsonrpc": "2.0",
                         "id": 1,
                         "method": "logsSubscribe",
                         "params": [
-                            {"mentions": [RAYDIUM_LP_V4]},
+                            {"mentions": [PUMP_FUN_PROGRAM, RAYDIUM_AMM, RAYDIUM_CLMM]},
                             {"commitment": "processed"}
                         ]
                     }
-                    await websocket.send(json.dumps(subscription_payload))
-                    logger.info("Subscription Active: Stream locked on Raydium LP program.")
+                    await ws.send(json.dumps(payload))
+                    logger.info("Subscription active across target liquidity protocols.")
 
-                    async for message in websocket:
+                    async for message in ws:
+                        if not self.is_running:
+                            break
                         data = json.loads(message)
-                        logs = data.get("params", {}).get("result", {}).get("value", {}).get("logs", [])
-                        
-                        if any("initialize2: InitializeInstruction" in log for log in logs):
-                            signature = data.get("params", {}).get("result", {}).get("value", {}).get("signature")
-                            logger.info(f"Detected launch pool block signature: {signature}")
-                            
-                            asyncio.create_task(process_transaction(httpx_client, signature, rpc_http_url))
+                        result = data.get("params", {}).get("result", {})
+                        if not result:
+                            continue
+
+                        logs = result.get("value", {}).get("logs", [])
+                        signature = result.get("value", {}).get("signature")
+
+                        # Fast pattern check inside transaction strings
+                        is_pump = any("Instruction: Create" in log for log in logs)
+                        is_raydium = any("initialize2: InitializeInstruction" in log or "createPool" in log for log in logs)
+
+                        if is_pump or is_raydium:
+                            logger.info(f"Detected initialization signature footprint: {signature}")
+                            await self.processing_queue.put(signature)
 
             except Exception as e:
-                logger.error(f"WebSocket interface dropped connection: {e}. Reconnecting in 3s...")
-                await asyncio.sleep(3)
+                logger.error(f"WebSocket execution exception: {e}. Reconnecting...")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60.0)
+
+    async def token_fetcher(self):
+        """Pulls signatures out of queue to parse raw text and fetch coin metrics"""
+        while self.is_running:
+            try:
+                signature = await self.processing_queue.get()
+                mint_address = await self.extract_mint_via_http(signature)
+                
+                if mint_address:
+                    # Execute API profiling concurrently
+                    asyncio.create_task(self.profile_and_route(mint_address))
+                
+                self.processing_queue.task_done()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error reading processing stack element: {e}")
+
+    async def alert_sender(self):
+        """Asynchronously dispatches formatted cards directly to Telegram endpoint"""
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        while self.is_running:
+            try:
+                payload_msg = await self.alert_queue.get()
+                response = await self.http_client.post(url, json=payload_msg)
+                
+                if response.status_code == 429:
+                    retry_after = response.json().get("parameters", {}).get("retry_after", 5)
+                    logger.warning(f"Telegram Rate limit hit. Backing off for {retry_after}s.")
+                    await asyncio.sleep(retry_after)
+                    await self.alert_queue.put(payload_msg)  # Re-enqueue
+                
+                self.alert_queue.task_done()
+                await asyncio.sleep(0.1)  # Guard rails
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Alert output dispatcher caught failure: {e}")
+
+    # ----------------------------------------------------
+    # EXTRACTION & METRIC VALIDATION UTILITIES
+    # ----------------------------------------------------
+    async def extract_mint_via_http(self, signature: str) -> str:
+        """Fetches block contents to manually locate custom token mint components"""
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTransaction",
+            "params": [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
+        }
+        try:
+            response = await self.http_client.post(SOLANA_RPC_HTTP, json=payload)
+            if response.status_code != 200:
+                return None
+            
+            tx_data = response.json().get("result", {})
+            if not tx_data:
+                return None
+
+            meta = tx_data.get("meta", {})
+            post_balances = meta.get("postTokenBalances", [])
+            
+            for balance in post_balances:
+                mint = balance.get("mint")
+                # Filter out the standard native wrap ledger
+                if mint and mint != "So11111111111111111111111111111111111111112":
+                    return mint
+        except Exception as e:
+            logger.error(f"Failed parsing block transaction signature data {signature}: {e}")
+        return None
+
+    async def profile_and_route(self, mint: str):
+        """Validates depth checks and structures the layout card mapping template"""
+        # Concurrent evaluation data retrieval
+        dex_task = self.http_client.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}")
+        rug_task = self.http_client.get(f"https://api.rugcheck.xyz/v1/tokens/{mint}/report")
+
+        try:
+            dex_resp, rug_resp = await asyncio.gather(dex_task, rug_task, return_exceptions=True)
+            
+            # Extract DEX data
+            pairs = []
+            if not isinstance(dex_resp, Exception) and dex_resp.status_code == 200:
+                pairs = dex_resp.json().get("pairs", []) or []
+
+            # If DexScreener hasn't indexed it yet, check liquidity parameters safely
+            liquidity = 0.0
+            mcap = 0.0
+            price = "0.00"
+            name = "Unknown"
+            symbol = "UNKNOWN"
+
+            if pairs:
+                primary_pair = max(pairs, key=lambda x: x.get("liquidity", {}).get("usd", 0) if x.get("liquidity") else 0)
+                liquidity = float(primary_pair.get("liquidity", {}).get("usd", 0) or 0)
+                mcap = float(primary_pair.get("marketCap", 0) or 0)
+                price = primary_pair.get("priceUsd", "0.00")
+                name = primary_pair.get("baseToken", {}).get("name", "Unknown")
+                symbol = primary_pair.get("baseToken", {}).get("symbol", "UNKNOWN")
+
+            # Apply constraints logic filter out noise
+            if pairs and liquidity < MIN_LIQUIDITY_USD:
+                return
+
+            # Extract Rugcheck metric payload
+            rug_score = "Unknown"
+            if not isinstance(rug_resp, Exception) and rug_resp.status_code == 200:
+                score = rug_resp.json().get("score")
+                rug_score = str(score) if score is not None else "Good"
+
+            # Formulate Markdown / HTML Presentation Card layout
+            alert_text = (
+                f"🚨 <b>NEW SOLANA MEME TOKEN SPOTTED</b> 🚨\n\n"
+                f"🪙 <b>Token:</b> {name} ({symbol})\n"
+                f"📃 <b>Mint/CA:</b>\n<code>{mint}</code>\n\n"
+                f"📊 <b>Market Cap:</b> ${mcap:,.2f}\n"
+                f"💧 <b>Liquidity:</b> ${liquidity:,.2f}\n"
+                f"💵 <b>Price:</b> ${price}\n"
+                f"🛡️ <b>RugCheck Score:</b> <code>{rug_score}</code>\n\n"
+                f"🔗 <a href='https://dexscreener.com/solana/{mint}'>Dexscreener</a> | "
+                f"<a href='https://birdeye.so/token/{mint}?chain=solana'>Birdeye</a> | "
+                f"<a href='https://solscan.io/token/{mint}'>Solscan</a>"
+            )
+
+            payload_msg = {
+                "chat_id": CHAT_ID,
+                "text": alert_text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True
+            }
+            await self.alert_queue.put(payload_msg)
+
+        except Exception as e:
+            logger.error(f"Error building analytics profile for mint {mint}: {e}")
+
+    async def shutdown(self):
+        logger.info("Graceful execution shutdown signal triggered...")
+        self.is_running = False
+        await self.close_client()
+
+
+radar = LiveMintRadar()
 
 @app.on_event("startup")
 async def startup_event():
-    asyncio.create_task(listen_to_blockchain())
-                            
+    await radar.init_client()
+    asyncio.create_task(radar.ws_listener())
+    asyncio.create_task(radar.token_fetcher())
+    asyncio.create_task(radar.alert_sender())
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await radar.shutdown()
+                                                              
